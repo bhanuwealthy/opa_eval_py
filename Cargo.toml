@@ -1,0 +1,20 @@
+[package]
+name = "opa-eval"
+version = "0.1.0"
+edition = "2021"
+description = "OPA policy evaluator using regorus — Python bindings"
+license = "Apache-2.0"
+
+[lib]
+name = "opa_eval"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module", "abi3", "abi3-py39", "generate-import-lib"] }
+regorus = "0.2"
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

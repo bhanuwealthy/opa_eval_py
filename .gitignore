@@ -1,0 +1,35 @@
+# Rust / Cargo
+/target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.egg-info/
+dist/
+.venv/
+
+# Maturin
+*.whl
+
+# OPA artifacts
+bundle.tar.gz
+*.wasm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Benchmarks
+.benchmarks/
+
+# Pytest
+.pytest_cache/
+
+target
