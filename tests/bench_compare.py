@@ -86,20 +86,20 @@ def opa_rest_eval(path: str, input_data: dict) -> dict:
 # --- Rust (in-process) -------
 
 def bench_rust_simple(iterations: int) -> float:
-    opa_eval.load_policy(POLICY_PATH, query="data.authz.allow")
+    policy = opa_eval.OpaEval(POLICY_PATH, query="data.authz.allow")
     inp = json.dumps({"role": "admin"})
     start = time.perf_counter()
     for _ in range(iterations):
-        opa_eval.evaluate(inp)
+        policy.evaluate(inp)
     return time.perf_counter() - start
 
 
 def bench_rust_deny(iterations: int) -> float:
-    opa_eval.load_policy(POLICY_PATH, query="data.authz.allow")
+    policy = opa_eval.OpaEval(POLICY_PATH, query="data.authz.allow")
     inp = json.dumps({"role": "viewer"})
     start = time.perf_counter()
     for _ in range(iterations):
-        opa_eval.evaluate(inp)
+        policy.evaluate(inp)
     return time.perf_counter() - start
 
 
@@ -107,22 +107,22 @@ def bench_rust_with_data(iterations: int) -> float:
     with tempfile.NamedTemporaryFile(suffix=".rego", mode="w", delete=False) as f:
         f.write(DATA_POLICY)
         f.flush()
-        opa_eval.load_policy(f.name, data_json=json.dumps(ROLES_DATA), query="data.rbac.allow")
+        policy = opa_eval.OpaEval(f.name, data_json=json.dumps(ROLES_DATA), query="data.rbac.allow")
     inp = json.dumps({"user": "user0"})
     start = time.perf_counter()
     for _ in range(iterations):
-        opa_eval.evaluate(inp)
+        policy.evaluate(inp)
     elapsed = time.perf_counter() - start
     os.unlink(f.name)
     return elapsed
 
 
 def bench_rust_large_input(iterations: int) -> float:
-    opa_eval.load_policy(POLICY_PATH, query="data.authz.allow")
+    policy = opa_eval.OpaEval(POLICY_PATH, query="data.authz.allow")
     inp = json.dumps({"role": "admin", "extra": {f"key{i}": f"val{i}" for i in range(200)}})
     start = time.perf_counter()
     for _ in range(iterations):
-        opa_eval.evaluate(inp)
+        policy.evaluate(inp)
     return time.perf_counter() - start
 
 

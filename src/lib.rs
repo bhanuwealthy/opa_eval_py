@@ -1,75 +1,9 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::Mutex;
 
-// ── Policy config (shared, read-heavy) ──────────────────────
-
-struct PolicyConfig {
-    path: String,
-    source: String,
-    data_json: Option<String>,
-    query: String,
-}
-
-static POLICY: RwLock<Option<PolicyConfig>> = RwLock::new(None);
-static POLICY_VERSION: AtomicU64 = AtomicU64::new(0);
-
-// ── Thread-local engine cache ───────────────────────────────
-// Each thread keeps a ready-to-use Engine.  On evaluate() we only
-// call set_input_json + eval_rule — no policy parsing, no cloning.
-// The version counter invalidates caches when load_policy() is called.
-
-thread_local! {
-    static CACHED_ENGINE: RefCell<Option<(u64, regorus::Engine)>> = const { RefCell::new(None) };
-}
-
-fn build_engine(cfg: &PolicyConfig) -> Result<regorus::Engine, String> {
-    let mut engine = regorus::Engine::new();
-    engine
-        .add_policy(cfg.path.clone(), cfg.source.clone())
-        .map_err(|e| format!("{e:#}"))?;
-    if let Some(ref data) = cfg.data_json {
-        engine
-            .add_data_json(data)
-            .map_err(|e| format!("{e:#}"))?;
-    }
-    Ok(engine)
-}
-
-fn do_eval(input_json: &str) -> Result<String, String> {
-    let guard = POLICY.read().unwrap();
-    let cfg = guard.as_ref().ok_or("call load_policy() first")?;
-    let ver = POLICY_VERSION.load(Ordering::Acquire);
-    let query = cfg.query.clone();
-
-    CACHED_ENGINE.with(|cell| {
-        let mut slot = cell.borrow_mut();
-
-        // Rebuild engine only when policy version changed or first call
-        let needs_rebuild = match *slot {
-            Some((v, _)) if v == ver => false,
-            _ => true,
-        };
-        if needs_rebuild {
-            *slot = Some((ver, build_engine(cfg)?));
-        }
-
-        let (_, engine) = slot.as_mut().unwrap();
-
-        engine
-            .set_input_json(input_json)
-            .map_err(|e| format!("{e:#}"))?;
-        let value = engine
-            .eval_rule(query)
-            .map_err(|e| format!("{e:#}"))?;
-        Ok(value.to_string())
-    })
-}
-
-// ── JSON → Python conversion (no Python json module) ────────
+// ── JSON → Python conversion (no Python json module) ────────────────────────
 
 fn json_to_py(py: Python<'_>, v: &serde_json::Value) -> PyResult<PyObject> {
     match v {
@@ -88,7 +22,10 @@ fn json_to_py(py: Python<'_>, v: &serde_json::Value) -> PyResult<PyObject> {
         }
         serde_json::Value::String(s) => Ok(PyString::new(py, s).into_any().unbind()),
         serde_json::Value::Array(arr) => {
-            let items: Vec<PyObject> = arr.iter().map(|v| json_to_py(py, v)).collect::<PyResult<_>>()?;
+            let items: Vec<PyObject> = arr
+                .iter()
+                .map(|v| json_to_py(py, v))
+                .collect::<PyResult<_>>()?;
             Ok(PyList::new(py, &items)?.into_any().unbind())
         }
         serde_json::Value::Object(map) => {
@@ -101,64 +38,132 @@ fn json_to_py(py: Python<'_>, v: &serde_json::Value) -> PyResult<PyObject> {
     }
 }
 
-/// OPA policy evaluator using regorus.
-///
-/// Usage:
-///     import opa_eval
-///     opa_eval.load_policy("policy.rego", query="data.authz.allow")
-///     result = opa_eval.evaluate('{"role": "admin"}')
-#[pymodule]
-fn opa_eval(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    /// Load a .rego policy file.
-    ///
-    /// Args:
-    ///     policy_path: Path to a .rego file.
-    ///     data_json:   Optional JSON string for external data.
-    ///     query:       Rego query to evaluate (default: "data").
-    #[pyfn(m)]
-    #[pyo3(signature = (policy_path, data_json=None, query=None))]
-    fn load_policy(
-        policy_path: &str,
-        data_json: Option<String>,
-        query: Option<String>,
-    ) -> PyResult<()> {
-        let source = std::fs::read_to_string(policy_path)
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to read {policy_path}: {e}")))?;
+// ── OpaEval pyclass ──────────────────────────────────────────────────────────
 
-        // Validate the policy parses
+/// An OPA policy evaluator backed by the regorus engine.
+///
+/// Each instance is independent: it loads its own `.rego` file, optional
+/// external data, and remembers the Rego query to run on every call to
+/// `evaluate` / `evaluate_parsed`.
+///
+/// Example
+/// -------
+/// >>> import opa_eval
+/// >>> authz = opa_eval.OpaEval("authz.rego", query="data.authz.allow")
+/// >>> result = authz.evaluate('{"role": "admin"}')
+/// >>> parsed = authz.evaluate_parsed('{"role": "admin"}')
+#[pyclass]
+struct OpaEval {
+    /// The compiled regorus engine, wrapped in a `Mutex` for `Send + Sync`.
+    /// `PyO3` requires `#[pyclass]` types to be `Send`; `Mutex<Engine>` satisfies
+    /// that as long as `regorus::Engine: Send` (verified at compile time).
+    engine: Mutex<regorus::Engine>,
+    /// Rego query evaluated on every call (e.g. `"data.authz.allow"`).
+    query: String,
+}
+
+#[pymethods]
+impl OpaEval {
+    /// Create a new `OpaEval` instance.
+    ///
+    /// Parameters
+    /// ----------
+    /// `policy_path` : str
+    ///     Path to a `.rego` source file.
+    /// `data_json` : str, optional
+    ///     JSON string providing external data (`data` document).
+    /// query : str, optional
+    ///     Rego rule to evaluate on each call.  Defaults to `"data"`.
+    #[new]
+    #[pyo3(signature = (policy_path, data_json=None, query=None))]
+    fn new(
+        policy_path: &str,
+        data_json: Option<&str>,
+        query: Option<String>,
+    ) -> PyResult<Self> {
+        let source = std::fs::read_to_string(policy_path).map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to read {policy_path}: {e}"))
+        })?;
+
         let mut engine = regorus::Engine::new();
         engine
-            .add_policy(policy_path.to_string(), source.clone())
+            .add_policy(policy_path.to_string(), source)
             .map_err(|e| PyRuntimeError::new_err(format!("invalid policy: {e:#}")))?;
 
-        *POLICY.write().unwrap() = Some(PolicyConfig {
-            path: policy_path.to_string(),
-            source,
-            data_json,
+        if let Some(data) = data_json {
+            engine
+                .add_data_json(data)
+                .map_err(|e| PyRuntimeError::new_err(format!("invalid data JSON: {e:#}")))?;
+        }
+
+        Ok(Self {
+            engine: Mutex::new(engine),
             query: query.unwrap_or_else(|| "data".to_string()),
-        });
-        // Bump version so thread-local caches rebuild
-        POLICY_VERSION.fetch_add(1, Ordering::Release);
-        Ok(())
+        })
     }
 
-    /// Evaluate the loaded policy with the given input JSON string.
-    /// Returns the result as a JSON string.
-    /// Thread-safe — each thread caches its own engine instance.
-    #[pyfn(m)]
-    fn evaluate(input_json: &str) -> PyResult<String> {
-        do_eval(input_json).map_err(|e| PyRuntimeError::new_err(e))
+    /// Evaluate the policy with the given input JSON and return a JSON string.
+    ///
+    /// Parameters
+    /// ----------
+    /// `input_json` : str
+    ///     JSON-encoded input document.
+    ///
+    /// Returns
+    /// -------
+    /// str
+    ///     The evaluation result serialised as a JSON string.
+    fn evaluate(&self, input_json: &str) -> PyResult<String> {
+        self.do_eval(input_json)
     }
 
-    /// Evaluate and return parsed Python object directly.
-    /// Converts JSON → Python in Rust (no Python json module overhead).
-    #[pyfn(m)]
-    fn evaluate_parsed(py: Python<'_>, input_json: &str) -> PyResult<PyObject> {
-        let json_str = do_eval(input_json).map_err(|e| PyRuntimeError::new_err(e))?;
+    /// Evaluate the policy and return the result as a native Python object.
+    ///
+    /// Converts JSON to Python entirely in Rust, avoiding any Python
+    /// `json.loads` overhead.
+    ///
+    /// Parameters
+    /// ----------
+    /// `input_json` : str
+    ///     JSON-encoded input document.
+    ///
+    /// Returns
+    /// -------
+    /// object
+    ///     The evaluation result as a Python `bool`, `int`, `float`,
+    ///     `str`, `list`, `dict`, or `None`.
+    fn evaluate_parsed(&self, py: Python<'_>, input_json: &str) -> PyResult<PyObject> {
+        let json_str = self.do_eval(input_json)?;
         let value: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| PyRuntimeError::new_err(format!("invalid result JSON: {e}")))?;
         json_to_py(py, &value)
     }
+}
 
+impl OpaEval {
+    /// Inner evaluation helper: locks the engine, sets input, runs the query.
+    fn do_eval(&self, input_json: &str) -> PyResult<String> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("engine lock poisoned: {e}")))?;
+
+        engine
+            .set_input_json(input_json)
+            .map_err(|e| PyRuntimeError::new_err(format!("invalid input JSON: {e:#}")))?;
+
+        let value = engine
+            .eval_rule(self.query.clone())
+            .map_err(|e| PyRuntimeError::new_err(format!("eval error: {e:#}")))?;
+
+        Ok(value.to_string())
+    }
+}
+
+// ── Module registration ──────────────────────────────────────────────────────
+
+#[pymodule]
+fn opa_eval(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<OpaEval>()?;
     Ok(())
 }

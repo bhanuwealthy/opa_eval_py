@@ -10,51 +10,51 @@ import opa_eval
 POLICY_PATH = os.path.join(os.path.dirname(__file__), "policy.rego")
 
 
-@pytest.fixture(autouse=True)
-def _load_authz_policy():
-    opa_eval.load_policy(POLICY_PATH, query="data.authz.allow")
+@pytest.fixture
+def policy():
+    return opa_eval.OpaEval(POLICY_PATH, query="data.authz.allow")
 
 
 # ── Basic allow / deny ────────────────────────────────────
 
 class TestBasicAuthz:
-    def test_admin_allowed(self):
-        assert opa_eval.evaluate_parsed(json.dumps({"role": "admin"})) is True
+    def test_admin_allowed(self, policy):
+        assert policy.evaluate_parsed(json.dumps({"role": "admin"})) is True
 
-    def test_editor_read_allowed(self):
-        assert opa_eval.evaluate_parsed(
+    def test_editor_read_allowed(self, policy):
+        assert policy.evaluate_parsed(
             json.dumps({"role": "editor", "action": "read"})
         ) is True
 
-    def test_editor_write_denied(self):
-        assert opa_eval.evaluate_parsed(
+    def test_editor_write_denied(self, policy):
+        assert policy.evaluate_parsed(
             json.dumps({"role": "editor", "action": "write"})
         ) is False
 
-    def test_viewer_denied(self):
-        assert opa_eval.evaluate_parsed(json.dumps({"role": "viewer"})) is False
+    def test_viewer_denied(self, policy):
+        assert policy.evaluate_parsed(json.dumps({"role": "viewer"})) is False
 
-    def test_empty_input_denied(self):
-        assert opa_eval.evaluate_parsed("{}") is False
+    def test_empty_input_denied(self, policy):
+        assert policy.evaluate_parsed("{}") is False
 
-    def test_no_role_denied(self):
-        assert opa_eval.evaluate_parsed(json.dumps({"action": "read"})) is False
+    def test_no_role_denied(self, policy):
+        assert policy.evaluate_parsed(json.dumps({"action": "read"})) is False
 
 
 # ── evaluate() returns valid JSON string ──────────────────
 
 class TestEvaluateRaw:
-    def test_returns_string(self):
-        result = opa_eval.evaluate(json.dumps({"role": "admin"}))
+    def test_returns_string(self, policy):
+        result = policy.evaluate(json.dumps({"role": "admin"}))
         assert isinstance(result, str)
 
-    def test_result_is_valid_json(self):
-        result = opa_eval.evaluate(json.dumps({"role": "admin"}))
+    def test_result_is_valid_json(self, policy):
+        result = policy.evaluate(json.dumps({"role": "admin"}))
         parsed = json.loads(result)
         assert parsed is True
 
-    def test_false_result_is_valid_json(self):
-        result = opa_eval.evaluate(json.dumps({"role": "nobody"}))
+    def test_false_result_is_valid_json(self, policy):
+        result = policy.evaluate(json.dumps({"role": "nobody"}))
         parsed = json.loads(result)
         assert parsed is False
 
@@ -80,14 +80,14 @@ class TestExternalData:
         with tempfile.NamedTemporaryFile(suffix=".rego", mode="w", delete=False) as f:
             f.write(DATA_POLICY)
             f.flush()
-            opa_eval.load_policy(
+            rbac_policy = opa_eval.OpaEval(
                 f.name,
                 data_json=json.dumps({"roles": {"alice": "admin", "bob": "viewer"}}),
                 query="data.rbac.allow",
             )
-        assert opa_eval.evaluate_parsed(json.dumps({"user": "alice"})) is True
-        assert opa_eval.evaluate_parsed(json.dumps({"user": "bob"})) is False
-        assert opa_eval.evaluate_parsed(json.dumps({"user": "unknown"})) is False
+        assert rbac_policy.evaluate_parsed(json.dumps({"user": "alice"})) is True
+        assert rbac_policy.evaluate_parsed(json.dumps({"user": "bob"})) is False
+        assert rbac_policy.evaluate_parsed(json.dumps({"user": "unknown"})) is False
         os.unlink(f.name)
 
 
@@ -96,25 +96,25 @@ class TestExternalData:
 class TestErrors:
     def test_missing_policy_file(self):
         with pytest.raises(RuntimeError, match="failed to read"):
-            opa_eval.load_policy("/nonexistent/policy.rego")
+            opa_eval.OpaEval("/nonexistent/policy.rego")
 
     def test_invalid_policy_syntax(self):
         with tempfile.NamedTemporaryFile(suffix=".rego", mode="w", delete=False) as f:
             f.write("not valid rego !!!")
             f.flush()
             with pytest.raises(RuntimeError, match="invalid policy"):
-                opa_eval.load_policy(f.name)
+                opa_eval.OpaEval(f.name)
         os.unlink(f.name)
 
-    def test_invalid_input_json(self):
+    def test_invalid_input_json(self, policy):
         with pytest.raises(RuntimeError):
-            opa_eval.evaluate("not json")
+            policy.evaluate("not json")
 
 
 # ── Thread safety ─────────────────────────────────────────
 
 class TestThreadSafety:
-    def test_concurrent_evaluations(self):
+    def test_concurrent_evaluations(self, policy):
         inputs = [
             ({"role": "admin"}, True),
             ({"role": "editor", "action": "read"}, True),
@@ -124,7 +124,7 @@ class TestThreadSafety:
 
         def eval_one(pair):
             inp, expected = pair
-            result = opa_eval.evaluate_parsed(json.dumps(inp))
+            result = policy.evaluate_parsed(json.dumps(inp))
             assert result is expected
             return True
 
@@ -134,22 +134,27 @@ class TestThreadSafety:
         assert all(results)
 
 
-# ── Query variations ──────────────────────────────────────
+# ── Multiple independent instances ────────────────────────
 
-class TestReloadPolicy:
-    def test_reload_with_different_query(self):
-        """Calling load_policy again replaces the previous policy."""
+class TestMultipleInstances:
+    def test_two_instances_are_independent(self):
+        """Two OpaEval instances evaluate against their own policy independently."""
         with tempfile.NamedTemporaryFile(suffix=".rego", mode="w", delete=False) as f:
             f.write(DATA_POLICY)
             f.flush()
-            opa_eval.load_policy(
+            rbac_policy = opa_eval.OpaEval(
                 f.name,
                 data_json=json.dumps({"roles": {"alice": "admin"}}),
                 query="data.rbac.allow",
             )
-        assert opa_eval.evaluate_parsed(json.dumps({"user": "alice"})) is True
 
-        # reload back to authz policy
-        opa_eval.load_policy(POLICY_PATH, query="data.authz.allow")
-        assert opa_eval.evaluate_parsed(json.dumps({"role": "admin"})) is True
+        authz_policy = opa_eval.OpaEval(POLICY_PATH, query="data.authz.allow")
+
+        # rbac instance resolves by user lookup against external data
+        assert rbac_policy.evaluate_parsed(json.dumps({"user": "alice"})) is True
+        # authz instance resolves by role field -- unaffected by rbac instance
+        assert authz_policy.evaluate_parsed(json.dumps({"role": "admin"})) is True
+        # cross-check: authz instance does not understand rbac inputs
+        assert authz_policy.evaluate_parsed(json.dumps({"user": "alice"})) is False
+
         os.unlink(f.name)

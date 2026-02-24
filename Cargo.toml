@@ -1,6 +1,6 @@
 [package]
 name = "opa-eval"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "OPA policy evaluator using regorus — Python bindings"
 license = "Apache-2.0"
