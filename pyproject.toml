@@ -4,9 +4,15 @@ build-backend = "maturin"
 
 [project]
 name = "opa-eval"
-version = "0.1.0"
+version = "0.1.1"
 description = "OPA policy evaluator using regorus"
+readme = "README.md"
 requires-python = ">=3.8"
+
+[project.urls]
+Homepage = "https://github.com/bhanuwealthy/opa_eval_py"
+Repository = "https://github.com/bhanuwealthy/opa_eval_py"
+Issues = "https://github.com/bhanuwealthy/opa_eval_py/issues"
 
 [tool.maturin]
 features = ["pyo3/extension-module", "pyo3/abi3-py39"]
